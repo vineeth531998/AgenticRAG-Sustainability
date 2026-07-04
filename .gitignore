@@ -1,0 +1,65 @@
+# ═════════════════════════════════════════════════════════════════════════
+# Secrets — NEVER commit
+# ═════════════════════════════════════════════════════════════════════════
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# ═════════════════════════════════════════════════════════════════════════
+# Runtime data — regenerated on ingest/query, don't ship in the repo
+# ═════════════════════════════════════════════════════════════════════════
+data/qdrant_local/
+data/reports/
+data/query_logs/
+data/batch_reports/
+data/probe/
+data/uploads/
+data/cache/
+
+# Debug artifacts from local probe runs
+chandra_probe_output.json
+*.probe.json
+
+# Root-level PDFs — sample reports, not part of the codebase
+*.pdf
+!docs/**/*.pdf
+
+# ═════════════════════════════════════════════════════════════════════════
+# Python — virtualenvs, byte code, package artifacts
+# ═════════════════════════════════════════════════════════════════════════
+.venv/
+venv/
+env/
+agentiragenv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Test / lint caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.tox/
+.coverage
+htmlcov/
+
+# ═════════════════════════════════════════════════════════════════════════
+# Editors / OS
+# ═════════════════════════════════════════════════════════════════════════
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ═════════════════════════════════════════════════════════════════════════
+# Streamlit
+# ═════════════════════════════════════════════════════════════════════════
+.streamlit/secrets.toml
