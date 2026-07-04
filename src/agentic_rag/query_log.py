@@ -83,18 +83,24 @@ def format_query_log(question: str, report_ids: list[str], result: QueryResult) 
         parts.append(f"    rationale    : {sq.rationale!r}")
         parts.append("")
 
-    # ── Planner sanitizer output ──────────────────────────────────────────
-    # Any subqueries dropped before execution — scratchpad noise,
-    # self-flagged duplicates, over-cap subqueries. Empty on a clean plan.
-    if result.trace.planner_sanitized_out:
+    # ── Subquery sanitizer output ─────────────────────────────────────────
+    # Subqueries dropped BEFORE execution — from any stage (planner OR
+    # any critic iteration). Grouped by stage for readability. Empty
+    # section on a clean plan.
+    if result.trace.sanitized_subqueries:
+        by_stage: dict[str, list[dict[str, str]]] = {}
+        for f in result.trace.sanitized_subqueries:
+            by_stage.setdefault(f.get("stage", "unknown"), []).append(f)
         parts.append(
-            f"\n## PLANNER SANITIZER — dropped "
-            f"{len(result.trace.planner_sanitized_out)} subquery(ies) "
-            f"before execution\n"
+            f"\n## SUBQUERY SANITIZER — dropped "
+            f"{len(result.trace.sanitized_subqueries)} subquery(ies) "
+            f"across {len(by_stage)} stage(s)\n"
         )
-        for i, f in enumerate(result.trace.planner_sanitized_out, start=1):
-            parts.append(f"[{i}] reason: {f['reason']}")
-            parts.append(f"    query : {f['query']!r}")
+        for stage, drops in by_stage.items():
+            parts.append(f"── stage: {stage} ({len(drops)} drop(s)) ──")
+            for i, f in enumerate(drops, start=1):
+                parts.append(f"  [{i}] reason: {f['reason']}")
+                parts.append(f"      query : {f['query']!r}")
             parts.append("")
 
     # ── Critic decisions ───────────────────────────────────────────────────

@@ -98,10 +98,11 @@ class QueryTrace:
     iterations: int = 0
     unfound_targets: list[str] = field(default_factory=list)
     vlm_verifications: list[VLMVerificationEvent] = field(default_factory=list)
-    # Subqueries the sanitizer removed before execution — kept for the
-    # audit log so we can see what the planner tried to leak (scratchpad
-    # noise, self-flagged duplicates, over-cap subqueries).
-    planner_sanitized_out: list[dict[str, str]] = field(default_factory=list)
+    # Subqueries the sanitizer removed before execution — from ANY stage
+    # (planner + every critic iteration). Each entry has a "stage" field
+    # ("planner" or e.g. "critic_iter_2"). Kept for the audit log so we
+    # can see what got leaked and where.
+    sanitized_subqueries: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -196,10 +197,18 @@ async def answer_query(
     planner_out = await plan(user_query, report_context=report_context)
 
     # DEFENSIVE SANITIZATION: even with a tightened prompt, some models
-    # occasionally leak planning-scratchpad subqueries (FINAL_REVIEW,
-    # HOWTO_*, self-flagged duplicates) into the executable array. Strip
-    # them out BEFORE they burn retrieval + LLM/VLM budget downstream.
-    kept, filtered = _sanitize_planner_output(planner_out.subqueries)
+    # leak planning-scratchpad subqueries (FINAL_REVIEW, HOWTO_*, self-
+    # flagged duplicates) into the executable array. Strip them out BEFORE
+    # they burn retrieval + LLM/VLM budget downstream. The same sanitizer
+    # runs after every critic iteration too, sharing the `seen_signatures`
+    # set so cross-iteration cosmetic reissues are caught (critic tries to
+    # rephrase what the planner already ran).
+    seen_signatures: set[tuple[str, tuple[str, ...]]] = set()
+    kept, filtered = _sanitize_subqueries(
+        planner_out.subqueries,
+        stage="planner",
+        seen_signatures=seen_signatures,
+    )
     if filtered:
         print(
             f"[planner-sanitize] dropped {len(filtered)}/"
@@ -217,7 +226,7 @@ async def answer_query(
     trace = QueryTrace(
         planner=planner_out,
         all_subqueries=list(planner_out.subqueries),
-        planner_sanitized_out=filtered,
+        sanitized_subqueries=list(filtered),
     )
     trace_ref["trace"] = trace
 
@@ -347,7 +356,44 @@ async def answer_query(
         if not critic_out.follow_up_subqueries:
             break
 
-        new_subs = critic_out.follow_up_subqueries
+        # Sanitize critic follow-ups the same way we sanitize planner
+        # output — same scratchpad + self-flag rules, plus CROSS-ITERATION
+        # dedup via the shared `seen_signatures` set. If the critic tries
+        # to rephrase a subquery the planner already ran (or a prior
+        # critic iteration already ran), it gets dropped here.
+        c_stage = f"critic_iter_{trace.iterations}"
+        c_kept, c_filtered = _sanitize_subqueries(
+            critic_out.follow_up_subqueries,
+            stage=c_stage,
+            seen_signatures=seen_signatures,
+        )
+        if c_filtered:
+            print(
+                f"[critic-sanitize] {c_stage}: dropped "
+                f"{len(c_filtered)}/{len(critic_out.follow_up_subqueries)} "
+                f"follow-ups (reasons: "
+                f"{', '.join(sorted({f['reason'] for f in c_filtered}))})",
+                flush=True,
+            )
+            emit("critic_sanitized",
+                 {"stage": c_stage,
+                  "original_count": len(critic_out.follow_up_subqueries),
+                  "kept_count": len(c_kept),
+                  "filtered": c_filtered})
+            critic_out.follow_up_subqueries = c_kept
+            trace.sanitized_subqueries.extend(c_filtered)
+
+        if not c_kept:
+            # Every follow-up was garbage. Stop the loop rather than
+            # burning another empty iteration.
+            print(
+                f"[critic-sanitize] {c_stage}: 0 follow-ups survived — "
+                f"exiting critic loop",
+                flush=True,
+            )
+            break
+
+        new_subs = c_kept
         trace.all_subqueries.extend(new_subs)
 
     # 5. Synthesizer
@@ -636,23 +682,48 @@ def _canonicalize_subquery_key(sub: Subquery) -> tuple[str, tuple[str, ...]]:
     return (q, tcs)
 
 
-def _sanitize_planner_output(
+def _sanitize_subqueries(
     subqueries: list[Subquery],
+    *,
+    stage: str = "planner",
+    seen_signatures: set[tuple[str, tuple[str, ...]]] | None = None,
+    max_new: int = 3,
 ) -> tuple[list[Subquery], list[dict[str, str]]]:
-    """Drop scratchpad-shaped and self-flagged-dropped subqueries; dedupe; cap.
+    """Drop scratchpad-shaped and self-flagged subqueries; dedupe; cap.
 
-    Returns (kept, filtered) where `filtered` is a list of
-    {"query": ..., "reason": ...} dicts for audit reporting. `kept` is
-    hard-capped at `settings.max_subqueries` (default 3) — the top-3 by
-    order of appearance in the model's output.
+    Used for BOTH the planner's initial output AND the critic's follow-ups
+    on each iteration. When `seen_signatures` is provided (a mutable set
+    of canonical `(query, target_cells)` signatures from prior stages /
+    iterations), incoming subqueries are also deduplicated against it —
+    so if the critic's iteration-2 follow-up cosmetically restates a
+    subquery the planner already ran in iteration 1, we catch it.
+
+    Kept subqueries' signatures are ADDED to `seen_signatures` in place,
+    so the same set can be threaded through subsequent stages.
+
+    Args:
+        subqueries: subqueries emitted by the LLM (planner or critic)
+        stage:     label stamped on every filtered entry — "planner" or
+                   e.g. "critic_iter_2". Shows up in the audit log so
+                   readers can see which stage a drop happened at.
+        seen_signatures: canonical signatures already accepted from prior
+                   stages/iterations. Mutated in-place — kept subqueries'
+                   signatures are added. Pass None on the first call
+                   (which creates a fresh set); pass the same set on
+                   subsequent calls to enable cross-stage dedup.
+        max_new:   cap on NEW subqueries accepted in this call. Follow-ups
+                   from the critic get max_new=3 too — the "3 max" HARD
+                   RULE applies per stage, not cumulatively (each iteration
+                   can legitimately try 1–3 new angles).
+
+    Returns:
+        (kept, filtered). Every entry in `filtered` has a "stage" field
+        stamped with the passed-in `stage` label.
     """
     kept: list[Subquery] = []
     filtered: list[dict[str, str]] = []
-    seen_keys: set[tuple[str, tuple[str, ...]]] = set()
-
-    # Hard cap on subqueries (matches the "3 max" HARD RULE in PLANNER_SYSTEM).
-    # Not a settings field yet — inline for now, easy to promote later.
-    max_subqueries = 3
+    if seen_signatures is None:
+        seen_signatures = set()
 
     for sub in subqueries:
         q_stripped = (sub.query or "").strip().lower()
@@ -666,6 +737,7 @@ def _sanitize_planner_output(
         )
         if matched_prefix is not None:
             filtered.append({
+                "stage": stage,
                 "query": sub.query,
                 "reason": f"scratchpad_query_prefix:{matched_prefix!r}",
             })
@@ -678,26 +750,33 @@ def _sanitize_planner_output(
         )
         if matched_phrase is not None:
             filtered.append({
+                "stage": stage,
                 "query": sub.query,
                 "reason": f"self_flagged_drop:{matched_phrase!r}",
             })
             continue
 
-        # Rule 3: dedupe by canonical (query, target_cells) signature
+        # Rule 3: dedupe by canonical (query, target_cells) signature.
+        # `seen_signatures` may already contain signatures from prior
+        # stages/iterations — that's how we catch cross-iteration
+        # cosmetic reissues (critic tries to rephrase what the planner
+        # already ran).
         key = _canonicalize_subquery_key(sub)
-        if key in seen_keys:
+        if key in seen_signatures:
             filtered.append({
+                "stage": stage,
                 "query": sub.query,
                 "reason": "duplicate_of_earlier_subquery",
             })
             continue
-        seen_keys.add(key)
+        seen_signatures.add(key)
 
-        # Rule 4: cap at 3 (drop the excess with a specific reason)
-        if len(kept) >= max_subqueries:
+        # Rule 4: cap at max_new (drop the excess with a specific reason)
+        if len(kept) >= max_new:
             filtered.append({
+                "stage": stage,
                 "query": sub.query,
-                "reason": f"exceeds_max_subqueries={max_subqueries}",
+                "reason": f"exceeds_max_subqueries={max_new}",
             })
             continue
 
