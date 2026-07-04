@@ -8,30 +8,45 @@ Built to be honest about what a report actually discloses: when a value is split
 
 ## Architecture — three parallel wings
 
-```
-                 Query
-                   │
-     ┌─────────────┼──────────────┐
-     ▼             ▼              ▼
- TABLE wing   COMPOSITE wing  NARRATIVE wing
- is_table=T   is_table=F      all chunks
- chunks       (top-5 by       (raw prose
-              rerank)          context)
-     │             │              │
-     │  ┌──────────┴────────┐     │
-     │  ▼                   │     │
- text_extract          text_extract│
-     ↓                   ↓        │
- VLM verify           VLM verify   │
- (independent)        (independent)│
-     ↓                   ↓        │
- VLM extract-        VLM extract- │
- from-unfound        from-unfound │
-     │                   │        │
-     └────── merged TableValues ──┴──► Synthesizer ──► cited answer
+```mermaid
+flowchart TD
+    Q([User Query]) --> P[Planner]
+    P --> R[Hybrid Retrieval<br/>parallel-union cascade<br/>dense + sparse → RRF → rerank]
+
+    R --> T["<b>TABLE wing</b><br/>is_table = True"]
+    R --> C["<b>COMPOSITE wing</b><br/>is_table = False<br/>top-5 by rerank"]
+    R --> N["<b>NARRATIVE wing</b><br/>all chunks as prose"]
+
+    T --> T1[Text extractor<br/>reads markdown / JSON tables]
+    T1 --> T2[VLM verify<br/>independent extraction on cropped pixels]
+    T2 --> T3[VLM extract-from-unfound<br/>rescue for missed targets]
+
+    C --> C1[Text extractor<br/>reads prose / lists]
+    C1 --> C2[VLM verify<br/>independent extraction on cropped pixels]
+    C2 --> C3[VLM extract-from-unfound<br/>rescue for missed targets]
+
+    T3 --> M[Merged TableValues<br/>+ unfound context with VLM notes]
+    C3 --> M
+    N --> S([Synthesizer])
+    M --> S
+    S --> A([Cited answer])
+
+    classDef wing fill:#eaf3ff,stroke:#4a90e2,stroke-width:2px
+    class T,C,N wing
+    classDef merged fill:#fff3cd,stroke:#f0ad4e,stroke-width:2px
+    class M merged
+    classDef terminus fill:#e8f5e9,stroke:#4caf50,stroke-width:2px
+    class Q,A terminus
 ```
 
-Each extraction wing runs a **text extractor** (reads Chandra's OCR output) and an **independent VLM** (reads the source PDF's cropped pixels). Their readings are merged symmetrically — value agreement upgrades to `high`; disagreement downgrades to `low` with both readings preserved in the audit trail.
+Each extraction wing runs a **text extractor** (over Chandra's OCR output) and an **independent VLM** (over the source PDF's cropped pixels — VLM never sees the text extractor's guess). The two readings are merged symmetrically:
+
+- **values agree + labels agree** → confidence upgraded to `high` (mutual vote)
+- **VLM `high` + disagrees** → REPLACE the text extractor's value (shifted-header rescue)
+- **VLM medium/low + disagrees** → keep original but downgrade to `low`, both readings preserved in note as `DISPUTED`
+- **VLM found=false with a note** → target flows to `unfound_context` for the synthesizer
+
+The synthesizer treats the pipeline's conclusions as **authoritative** — if a target is unfound, it does not re-derive the value from raw chunk markdown. VLM notes become the primary evidence for what the report actually discloses.
 
 ---
 
